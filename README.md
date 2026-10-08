@@ -18,6 +18,8 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 The API is available at `http://127.0.0.1:8000`. Interactive docs: `http://127.0.0.1:8000/docs`.
 
+Dino Run (same server): `http://127.0.0.1:8000/` or `http://127.0.0.1:8000/dino`.
+
 ## Test with curl
 
 ```bash
