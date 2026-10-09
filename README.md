@@ -18,7 +18,9 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 The API is available at `http://127.0.0.1:8000`. Interactive docs: `http://127.0.0.1:8000/docs`.
 
-Dino Run (same server): `http://127.0.0.1:8000/` or `http://127.0.0.1:8000/dino`.
+Dino Run (same server): `http://127.0.0.1:8000/` or `http://127.0.0.1:8000/dino`. Choose **AI** above the game and press Space to start; Laya will choose whether to run, jump, or duck. Game over still waits for Space to restart. **Manual** mode remains the default. In AI mode, **Local timing assist** is off by default, so actions come only from Laya's decisions; enable it to add the browser's frame-by-frame timing guard (jump within 0.30 seconds of contact, duck within 0.35 seconds) alongside Laya. The decision prompt accounts for recent request latency and asks Laya to wait until a jump will be timely when its response reaches the game. Expand **AI debug** below the game to inspect the latest snapshot, Laya's choice and confidence, why an action was or wasn't applied, the last five Laya decisions, and any request errors.
+
+The `/predict` endpoint is unchanged and remains available for the ticket-routing example below.
 
 ## Test with curl
 

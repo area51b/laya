@@ -18,6 +18,18 @@
       align-items: center;
       justify-content: center;
     }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      color: #535353;
+      font-size: 13px;
+    }
+    select {
+      font: inherit;
+      color: inherit;
+    }
     canvas {
       background: #f7f7f7;
       border: 1px solid #d3d3d3;
@@ -28,17 +40,50 @@
       color: #535353;
       font-size: 13px;
     }
+    .debug {
+      width: min(600px, calc(100vw - 24px));
+      margin-top: 10px;
+      color: #535353;
+      font-size: 12px;
+    }
+    .debug pre {
+      max-height: 240px;
+      overflow: auto;
+      padding: 8px;
+      background: #eee;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
   </style>
 </head>
 <body>
+  <div class="controls">
+    <label for="mode">Mode</label>
+    <select id="mode">
+      <option value="manual">Manual</option>
+      <option value="ai">AI</option>
+    </select>
+    <label>
+      <input id="local-timing" type="checkbox">
+      Local timing assist
+    </label>
+  </div>
   <canvas id="game" width="600" height="150"></canvas>
-  <p>Space / ↑ jump · ↓ duck · open this file in a browser</p>
+  <p>Space to start / restart · Manual: ↑ jump, ↓ duck</p>
+  <details id="ai-debug" class="debug">
+    <summary>AI debug</summary>
+    <pre id="ai-debug-output">Waiting for an AI decision.</pre>
+  </details>
   <script>
     (function () {
       "use strict";
 
       const canvas = document.getElementById("game");
       const ctx = canvas.getContext("2d");
+      const modeSelect = document.getElementById("mode");
+      const localTimingToggle = document.getElementById("local-timing");
+      const aiDebugDetails = document.getElementById("ai-debug");
+      const aiDebugOutput = document.getElementById("ai-debug-output");
       const WIDTH = canvas.width;
       const HEIGHT = canvas.height;
 
@@ -78,6 +123,10 @@
       const GAP_RANDOM_START = 340;
       const GAP_RANDOM_END = 180;
       const SPAWN_START_DELAY = 520;
+      const AI_LOOKAHEAD_DISTANCE = 650;
+      const AI_JUMP_LEAD_SECONDS = 0.30;
+      const AI_DUCK_LEAD_SECONDS = 0.35;
+      const AI_EMPTY_POLL_MS = 300;
 
       const HIGH_SCORE_KEY = "dino-run-high-score";
 
@@ -105,6 +154,79 @@
       let spawnDistance = SPAWN_START_DELAY;
       let obstacles = [];
       let lastTime = 0;
+      let aiAction = "run";
+      let aiBusy = false;
+      let aiLastRequestAt = 0;
+      let aiRequestId = 0;
+      let aiAppliedAction = "run";
+      let aiActionSource = "idle";
+      let aiActionTarget = null;
+      let aiDecisionTarget = null;
+      let aiDecisionGroundedWhenReceived = false;
+      let aiJumpPending = false;
+      let aiHandledJumps = new WeakSet();
+      let aiDebugLastRenderAt = 0;
+      let aiDebugStatus = "idle";
+      let aiDebugRequest = null;
+      let aiDebugResponse = null;
+      let aiDebugError = null;
+      let aiDecisionHistory = [];
+      let aiLatestDecision = null;
+      let aiLatencySamples = [];
+
+      function renderAiDebug() {
+        aiDebugOutput.textContent = JSON.stringify({
+          status: aiDebugStatus,
+          mode: isAiMode() ? "AI" : "Manual",
+          localTimingAssist: localTimingToggle.checked,
+          averageDecisionLatencyMs: aiLatencySamples.length
+            ? Math.round(aiLatencySamples.reduce(function (sum, latency) {
+              return sum + latency;
+            }, 0) / aiLatencySamples.length)
+            : 0,
+          current: {
+            modelAction: aiAction,
+            appliedAction: aiAppliedAction,
+            actionSource: aiActionSource,
+            actionTarget: aiActionTarget,
+            lastDecisionTarget: aiDecisionTarget
+              ? { kind: aiDecisionTarget.kind, variant: aiDecisionTarget.variant }
+              : null,
+            timingWindowsSeconds: {
+              jump: AI_JUMP_LEAD_SECONDS,
+              duck: AI_DUCK_LEAD_SECONDS
+            },
+            grounded: dino.grounded,
+            ducking: dino.ducking,
+            speed: Math.round(speed),
+            score: Math.floor(score),
+            obstacles: obstacles
+              .filter(function (obstacle) {
+                return obstacle.x + obstacle.w >= dino.x;
+              })
+              .sort(function (a, b) { return a.x - b.x; })
+              .slice(0, 2)
+              .map(function (obstacle) {
+                return {
+                  kind: obstacle.kind,
+                  variant: obstacle.variant,
+                  distance: Math.round(obstacle.x - (dino.x + dino.w)),
+                  y: obstacle.y,
+                  width: obstacle.w,
+                  height: obstacle.h
+                };
+              })
+          },
+          lastRequest: aiDebugRequest,
+          lastResponse: aiDebugResponse,
+          lastDecisions: aiDecisionHistory,
+          error: aiDebugError
+        }, null, 2);
+      }
+
+      function isAiMode() {
+        return modeSelect.value === "ai";
+      }
 
       try {
         highScore = Number(localStorage.getItem(HIGH_SCORE_KEY) || 0) || 0;
@@ -186,6 +308,21 @@
       }
 
       function resetGame() {
+        aiRequestId++;
+        aiBusy = false;
+        aiLastRequestAt = 0;
+        aiAction = "run";
+        aiAppliedAction = "run";
+        aiActionSource = "idle";
+        aiActionTarget = null;
+        aiDecisionTarget = null;
+        aiJumpPending = false;
+        aiDecisionHistory = [];
+        aiLatestDecision = null;
+        aiLatencySamples = [];
+        aiHandledJumps = new WeakSet();
+        keys.jump = false;
+        keys.duck = false;
         speed = BASE_SPEED;
         score = 0;
         groundOffset = 0;
@@ -245,7 +382,232 @@
         }
       }
 
+      function upcomingObstacles() {
+        return obstacles
+          .filter(function (obstacle) {
+            return obstacle.x + obstacle.w >= dino.x;
+          })
+          .sort(function (a, b) { return a.x - b.x; });
+      }
+
+      function requestAiAction() {
+        if (!isAiMode() || aiBusy) return;
+
+        const upcoming = upcomingObstacles().slice(0, 2);
+        const nearestDistance = upcoming.length
+          ? upcoming[0].x - (dino.x + dino.w)
+          : Infinity;
+        const now = performance.now();
+        if (nearestDistance > AI_LOOKAHEAD_DISTANCE &&
+            now - aiLastRequestAt < AI_EMPTY_POLL_MS) return;
+
+        const requestId = ++aiRequestId;
+        aiBusy = true;
+        aiLastRequestAt = now;
+        const decisionTarget = upcoming.find(function (obstacle) {
+          return obstacle.kind === "cactus" ||
+            obstacle.variant === "duck" ||
+            obstacle.variant === "jump";
+        }) || null;
+        const requestSnapshot = {
+          grounded: dino.grounded,
+          ducking: dino.ducking,
+          speed: speed,
+          score: score,
+          decision_latency_ms: aiLatencySamples.length
+            ? aiLatencySamples.reduce(function (sum, latency) {
+              return sum + latency;
+            }, 0) / aiLatencySamples.length
+            : 0,
+          obstacles: upcoming.map(function (obstacle) {
+            return {
+              kind: obstacle.kind,
+              variant: obstacle.variant,
+              x: obstacle.x - (dino.x + dino.w),
+              y: obstacle.y,
+              w: obstacle.w,
+              h: obstacle.h
+            };
+          })
+        };
+        aiDebugRequest = requestSnapshot;
+        aiDebugResponse = null;
+        aiDebugError = null;
+        aiDebugStatus = "request pending";
+        renderAiDebug();
+        const startedAt = performance.now();
+        fetch("/dino/act", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestSnapshot)
+        })
+          .then(function (response) {
+            if (!response.ok) throw new Error("AI action request failed: " + response.status);
+            return response.json();
+          })
+          .then(function (result) {
+            if (requestId !== aiRequestId || !isAiMode()) return;
+            const latencyMs = Math.round(performance.now() - startedAt);
+            aiLatencySamples.push(latencyMs);
+            if (aiLatencySamples.length > 5) aiLatencySamples.shift();
+            aiAction = ["run", "jump", "duck"].indexOf(result.action) !== -1
+              ? result.action
+              : "run";
+            aiJumpPending = !localTimingToggle.checked &&
+              result.action === "jump" &&
+              requestSnapshot.grounded &&
+              dino.grounded;
+            aiDecisionTarget = decisionTarget;
+            aiDecisionGroundedWhenReceived = dino.grounded;
+            aiDebugResponse = {
+              action: result.action,
+              debug: result.debug || null,
+              latencyMs: latencyMs,
+              groundedWhenReceived: dino.grounded
+            };
+            aiLatestDecision = {
+              receivedAt: new Date().toLocaleTimeString(),
+              status: state === STATE_PLAYING ? "received" : "received after game ended",
+              request: requestSnapshot,
+              response: aiDebugResponse,
+              appliedAction: state === STATE_PLAYING ? "pending" : "not applied (game ended)",
+              actionSource: null,
+              applicationReason: state === STATE_PLAYING ? "Waiting for game loop." : "Response arrived after game over."
+            };
+            aiDecisionHistory.push(aiLatestDecision);
+            if (aiDecisionHistory.length > 5) aiDecisionHistory.shift();
+            aiDebugStatus = "decision received";
+            renderAiDebug();
+          })
+          .catch(function (error) {
+            if (requestId !== aiRequestId) return;
+            aiAction = "run";
+            aiJumpPending = false;
+            aiDebugError = error.message;
+            aiDebugStatus = "request failed";
+            renderAiDebug();
+          })
+          .finally(function () {
+            if (requestId === aiRequestId) {
+              aiBusy = false;
+              renderAiDebug();
+            }
+          });
+      }
+
+      function applyLayaAction() {
+        let action = aiAction;
+        let applicationReason = "Laya chose run.";
+        if (action === "jump") {
+          if (aiJumpPending && dino.grounded) {
+            aiJumpPending = false;
+            jump();
+            applicationReason = "Laya chose jump and the dino was grounded; jump started.";
+          } else {
+            action = "run";
+            applicationReason = !aiLatestDecision ||
+              !aiLatestDecision.request.grounded
+              ? "Laya chose jump, but the dino was airborne in the request snapshot."
+              : !aiDecisionGroundedWhenReceived
+                ? "Laya chose jump, but the dino was already airborne when the response arrived."
+                : "Laya chose jump, but a jump was no longer eligible when applied.";
+          }
+        } else {
+          aiJumpPending = false;
+          if (action === "duck") applicationReason = "Laya chose duck.";
+        }
+
+        aiAppliedAction = action;
+        aiActionSource = "Laya";
+        aiActionTarget = aiDecisionTarget
+          ? { kind: aiDecisionTarget.kind, variant: aiDecisionTarget.variant }
+          : null;
+        keys.duck = action === "duck";
+        if (aiLatestDecision && aiLatestDecision.appliedAction === "pending") {
+          aiLatestDecision.appliedAction = action;
+          aiLatestDecision.actionSource = "Laya";
+          aiLatestDecision.applicationReason = applicationReason;
+          aiLatestDecision.status = "applied";
+        }
+      }
+
+      function updateAiControl() {
+        if (!localTimingToggle.checked) {
+          applyLayaAction();
+          if (aiDebugDetails.open && performance.now() - aiDebugLastRenderAt >= 100) {
+            aiDebugLastRenderAt = performance.now();
+            renderAiDebug();
+          }
+          return;
+        }
+
+        const nearest = upcomingObstacles().find(function (obstacle) {
+          return obstacle.kind === "cactus" ||
+            obstacle.variant === "duck" ||
+            obstacle.variant === "jump";
+        });
+        let action = "run";
+        let source = "waiting";
+        let target = null;
+
+        if (nearest) {
+          const distance = nearest.x - (dino.x + dino.w);
+          const isHeadBird = nearest.kind === "bird" && nearest.variant === "duck";
+          const isOverlapping = nearest.x < dino.x + dino.w &&
+            nearest.x + nearest.w > dino.x;
+          target = {
+            kind: nearest.kind,
+            variant: nearest.variant,
+            distance: Math.round(distance),
+            timeToContact: Math.max(0, distance) / speed
+          };
+
+          if (isHeadBird && dino.grounded &&
+              (isOverlapping || (distance >= 0 && distance <= speed * AI_DUCK_LEAD_SECONDS))) {
+            action = "duck";
+          } else if (!isHeadBird && dino.grounded &&
+              !aiHandledJumps.has(nearest) &&
+              distance >= -HITBOX_INSET * 2 &&
+              distance <= speed * AI_JUMP_LEAD_SECONDS) {
+            action = "jump";
+          }
+
+          if (action !== "run") {
+            source = aiAction === action && aiDecisionTarget === nearest
+              ? "Laya"
+              : "local timing safety";
+            if (action === "jump") aiHandledJumps.add(nearest);
+          } else if (!dino.grounded) {
+            source = "airborne";
+          } else if (aiAction !== "run") {
+            source = "Laya action outside local timing window";
+          }
+        }
+
+        aiAppliedAction = action;
+        aiActionSource = source;
+        aiActionTarget = target;
+        keys.duck = action === "duck";
+        if (action === "jump") jump();
+        if (aiLatestDecision && aiLatestDecision.appliedAction === "pending") {
+          aiLatestDecision.appliedAction = action;
+          aiLatestDecision.actionSource = source;
+          aiLatestDecision.applicationReason = "Applied by " + source + ".";
+          aiLatestDecision.status = "applied";
+        }
+
+        if (aiDebugDetails.open && performance.now() - aiDebugLastRenderAt >= 100) {
+          aiDebugLastRenderAt = performance.now();
+          renderAiDebug();
+        }
+      }
+
       function updatePlaying(dt) {
+        if (isAiMode()) {
+          requestAiAction();
+          updateAiControl();
+        }
+
         if (keys.duck) {
           setDucking(true);
         } else if (dino.ducking && dino.grounded) {
@@ -409,6 +771,10 @@
         const live = padScore(score);
         const hi = "HI " + padScore(highScore);
         ctx.fillText(hi + "  " + live, WIDTH - 10, 8);
+        if (isAiMode()) {
+          ctx.textAlign = "left";
+          ctx.fillText("AI: " + aiAppliedAction, 10, 8);
+        }
       }
 
       function drawOverlay(title, subtitle) {
@@ -461,6 +827,32 @@
         return e.code === "Space" || e.code === "ArrowUp";
       }
 
+      modeSelect.addEventListener("change", function () {
+        aiRequestId++;
+        aiBusy = false;
+        aiLastRequestAt = 0;
+        aiAction = "run";
+        aiAppliedAction = "run";
+        aiActionSource = "idle";
+        aiActionTarget = null;
+        aiDecisionTarget = null;
+        aiDecisionGroundedWhenReceived = false;
+        aiJumpPending = false;
+        keys.jump = false;
+        keys.duck = false;
+        aiDebugStatus = "idle";
+        aiDebugError = null;
+        renderAiDebug();
+      });
+
+      localTimingToggle.addEventListener("change", function () {
+        aiJumpPending = false;
+        aiAppliedAction = "run";
+        aiActionSource = localTimingToggle.checked ? "local timing enabled" : "Laya only";
+        aiActionTarget = null;
+        renderAiDebug();
+      });
+
       window.addEventListener("keydown", function (e) {
         if (isJumpKey(e) || e.code === "ArrowDown") e.preventDefault();
 
@@ -475,16 +867,19 @@
             state = STATE_PLAYING;
             return;
           }
+          if (isAiMode()) return;
           keys.jump = true;
           jump();
         }
 
-        if (e.code === "ArrowDown") keys.duck = true;
+        if (e.code === "ArrowDown" && !(isAiMode() && state === STATE_PLAYING)) {
+          keys.duck = true;
+        }
       });
 
       window.addEventListener("keyup", function (e) {
         if (isJumpKey(e)) keys.jump = false;
-        if (e.code === "ArrowDown") keys.duck = false;
+        if (e.code === "ArrowDown" && !isAiMode()) keys.duck = false;
       });
 
       requestAnimationFrame(loop);
