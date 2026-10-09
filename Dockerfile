@@ -1,0 +1,26 @@
+# laya 0.4.1 needs Python 3.10+.
+FROM python:3.11-slim
+
+# Hugging Face Spaces run the container as user 1000.
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false
+WORKDIR $HOME/app
+
+COPY --chown=user requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Download the model weights while building, so a Space that went to sleep wakes up
+# without re-downloading them. If this step fails the build still succeeds and the
+# weights are fetched on first start instead.
+RUN python -c "import laya; laya.Router(preload=True, device='cpu')" \
+    || echo "Model prefetch skipped; weights will download at startup."
+
+COPY --chown=user . $HOME/app
+
+EXPOSE 7860
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]

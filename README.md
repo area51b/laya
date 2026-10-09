@@ -1,110 +1,34 @@
-# Predict API
+---
+title: Dino Run with Laya
+emoji: 🦖
+colorFrom: gray
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
 
-A sample FastAPI app that serves a `/predict` endpoint returning `"hello"`.
+# Dino Run with Laya
 
-## Setup
+A small runner game where you can switch to **AI** mode and let the
+[Laya](https://pypi.org/project/laya/) decision model choose between run, jump and duck.
+
+- `GET /` serves the game.
+- `POST /dino/act` takes a snapshot of the game and returns the action to take.
+- `POST /predict` is raw model access and is **disabled by default**. Add a Space secret named
+  `PREDICT_TOKEN` to enable it; callers then send that value in an `x-api-key` header.
+
+## Run locally
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-## Run
+Then open http://127.0.0.1:8000/.
 
-```bash
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
-```
+## Notes
 
-The API is available at `http://127.0.0.1:8000`. Interactive docs: `http://127.0.0.1:8000/docs`.
-
-Dino Run (same server): `http://127.0.0.1:8000/` or `http://127.0.0.1:8000/dino`. Choose **AI** above the game and press Space to start; Laya will choose whether to run, jump, or duck. Game over still waits for Space to restart. **Manual** mode remains the default. In AI mode, **Local timing assist** is off by default, so actions come only from Laya's decisions; enable it to add the browser's frame-by-frame timing guard (jump within 0.30 seconds of contact, duck within 0.35 seconds) alongside Laya. The decision prompt accounts for recent request latency and asks Laya to wait until a jump will be timely when its response reaches the game. Expand **AI debug** below the game to inspect the latest snapshot, Laya's choice and confidence, why an action was or wasn't applied, the last five Laya decisions, and any request errors.
-
-The `/predict` endpoint is unchanged and remains available for the ticket-routing example below.
-
-## Test with curl
-
-```bash
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{
-    "state": {
-      "body": "I was double-charged, please refund me today or I will cancel."
-    },
-    "questions": {
-      "department": {
-        "type": "choice",
-        "instructions": "Which department should handle this request?",
-        "criteria": {
-          "billing": "invoices, payments, refunds",
-          "technical": "bugs, outages, system errors",
-          "sales": "pricing, new contracts",
-          "other": "everything else"
-        }
-      },
-      "urgency": {
-        "type": "score",
-        "instructions": "How urgent is this request?",
-        "criteria": ["not urgent", "soon", "critical deadline or blocking issue"]
-      },
-      "churn_risk": {
-        "type": "noul",
-        "instructions": "Does the user threaten to cancel or leave?"
-      }
-    }
-  }'
-```
-
-```bash
-curl -s -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{"state": {"body": "test message"}, "questions": {"urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["not urgent", "soon", "critical"]}}}' \
-  | jq
-```
-
-Expected response:
-
-```json
-{
-  "model": "laya-rl-agent",
-  "answers": {
-    "urgency": {
-      "type": "score",
-      "score": 0.3401,
-      "legend": {
-        "0": "not urgent",
-        "1": "soon",
-        "2": "critical"
-      },
-      "probabilities": {
-        "0": 0.6805,
-        "1": 0.2989,
-        "2": 0.0206
-      },
-      "confidence": 0.3602,
-      "action": {
-        "act_probability": 1.0
-      }
-    }
-  },
-  "usage": {
-    "input_tokens": 33,
-    "output_tokens": 0
-  },
-  "routing": {
-    "model": "english",
-    "repo": "convaiinnovations/laya",
-    "reason": "English Latin text",
-    "detection": {
-      "script": "latin",
-      "script_profile": {
-        "latin": 1.0
-      },
-      "language": null,
-      "is_english": true,
-      "non_latin_fraction": 0.0
-    },
-    "workflow": null
-  }
-}
-```
+- The model loads at startup, so the first request after the Space wakes up can be slow.
+- Each AI decision is a network round trip plus inference. Turn on **Local timing assist** in the
+  game if the dino reacts late.

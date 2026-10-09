@@ -1,7 +1,8 @@
+import secrets
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import laya, os
@@ -12,6 +13,10 @@ router = laya.Router(preload=True, device="cpu")  # for mac, use "cpu" or "cuda"
 
 BASE_DIR = Path(__file__).resolve().parent
 DINO_HTML = BASE_DIR / "dino.html"
+
+# /predict gives raw access to the model, which the game never needs. It stays disabled
+# (404) unless PREDICT_TOKEN is set; then callers must send it in an x-api-key header.
+PREDICT_TOKEN = os.environ.get("PREDICT_TOKEN", "")
 
 # Keep these in sync with AI_JUMP_LEAD_SECONDS / AI_DUCK_LEAD_SECONDS in dino.html.
 JUMP_LEAD_SECONDS = 0.30
@@ -47,7 +52,13 @@ def dino():
 
 
 @app.post("/predict")
-def predict(payload: dict):
+def predict(payload: dict, x_api_key: Optional[str] = Header(default=None)):
+    if not PREDICT_TOKEN:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key.encode("utf-8"), PREDICT_TOKEN.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid API key")
     return router.predict(payload["state"], payload["questions"])
 
 
