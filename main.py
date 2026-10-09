@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -12,6 +12,14 @@ router = laya.Router(preload=True, device="cpu")  # for mac, use "cpu" or "cuda"
 
 BASE_DIR = Path(__file__).resolve().parent
 DINO_HTML = BASE_DIR / "dino.html"
+
+# Keep these in sync with AI_JUMP_LEAD_SECONDS / AI_DUCK_LEAD_SECONDS in dino.html.
+JUMP_LEAD_SECONDS = 0.30
+DUCK_LEAD_SECONDS = 0.35
+JUMP_LATE_PIXELS = 12      # a jump is still useful if the obstacle is at most this far inside the dino
+DINO_STAND_WIDTH = 44      # an obstacle further behind than this has passed the dino
+
+ACTIONS = ("run", "jump", "duck")
 
 
 class DinoObstacle(BaseModel):
@@ -43,68 +51,148 @@ def predict(payload: dict):
     return router.predict(payload["state"], payload["questions"])
 
 
-@app.post("/dino/act")
-def dino_act(snapshot: DinoSnapshot):
-    posture = "ducking" if snapshot.ducking else "grounded" if snapshot.grounded else "airborne"
-    details = [
-        f"The dino is {posture}.",
-        f"Speed is {snapshot.speed:.0f} pixels/second and score is {snapshot.score:.0f}.",
-        f"Recent end-to-end decision latency is {snapshot.decision_latency_ms:.0f} ms.",
+# ---------------------------------------------------------------------------
+# Decision helpers. All the arithmetic happens here, not in the model.
+# ---------------------------------------------------------------------------
+
+def required_action(obstacle: DinoObstacle) -> Literal["jump", "duck", "ignore"]:
+    """The action that gets past this obstacle, or "ignore" if running is already safe."""
+    if obstacle.kind == "cactus":
+        return "jump"
+    if obstacle.variant == "duck":
+        return "duck"
+    if obstacle.variant == "jump":
+        return "jump"
+    return "ignore"  # high bird
+
+
+def find_threat(snapshot: DinoSnapshot) -> Optional[dict]:
+    """Nearest obstacle that needs a reaction, with timing as it will be when the decision lands."""
+    latency_seconds = snapshot.decision_latency_ms / 1000
+    for obstacle in sorted(snapshot.obstacles, key=lambda o: o.x):
+        need = required_action(obstacle)
+        if need == "ignore":
+            continue
+
+        distance_on_arrival = obstacle.x - snapshot.speed * latency_seconds
+        if distance_on_arrival + obstacle.w < -DINO_STAND_WIDTH:
+            continue  # will already be behind the dino
+
+        time_on_arrival = max(0.0, distance_on_arrival) / snapshot.speed
+        if need == "jump":
+            if distance_on_arrival < -JUMP_LATE_PIXELS:
+                window = "missed"
+            elif time_on_arrival <= JUMP_LEAD_SECONDS:
+                window = "now"
+            else:
+                window = "early"
+        else:
+            reached = distance_on_arrival < 0
+            window = "now" if reached or time_on_arrival <= DUCK_LEAD_SECONDS else "early"
+
+        return {
+            "kind": obstacle.kind,
+            "variant": obstacle.variant,
+            "need": need,
+            "window": window,
+            "distance_on_arrival": round(distance_on_arrival, 1),
+            "time_on_arrival": round(time_on_arrival, 3),
+        }
+    return None
+
+
+def allowed_actions(snapshot: DinoSnapshot, threat: Optional[dict]) -> set[str]:
+    """Run is always valid. Jump/duck only when grounded, the right obstacle is in its window."""
+    allowed = {"run"}
+    if snapshot.grounded and threat and threat["window"] == "now":
+        allowed.add(threat["need"])
+    return allowed
+
+
+def describe_state(snapshot: DinoSnapshot, threat: Optional[dict]) -> str:
+    # The dino's current posture is deliberately left out: a small classifier tends to
+    # echo it ("ducking" -> "duck") instead of reasoning about the obstacle.
+    lines = [
+        "The dino is on the ground."
+        if snapshot.grounded
+        else "The dino is in the air and cannot jump or duck."
     ]
 
-    for index, obstacle in enumerate(snapshot.obstacles, start=1):
-        contact_distance = max(0, obstacle.x)
-        contact_time = contact_distance / snapshot.speed
-        distance_on_arrival = (
-            obstacle.x - snapshot.speed * snapshot.decision_latency_ms / 1000
-        )
-        time_on_arrival = max(0, distance_on_arrival) / snapshot.speed
-        description = f"Obstacle {index}: {obstacle.variant} {obstacle.kind}"
-        if obstacle.kind == "bird":
-            if obstacle.variant == "duck":
-                description += "; head-height bird, standing would hit, ducking can pass under"
-            elif obstacle.variant == "jump":
-                description += "; low bird, ducking would still hit, jump over it"
-            elif obstacle.variant == "safe":
-                description += "; high bird, safe to run under"
-        else:
-            description += "; cactus, jump over it"
-        distance = (
-            f"{obstacle.x:.0f} pixels ahead"
-            if obstacle.x >= 0
-            else f"{abs(obstacle.x):.0f} pixels into the dino's horizontal space"
-        )
-        details.append(
-            f"{description}; {distance}, "
-            f"{contact_time:.2f} seconds to contact, at y={obstacle.y:.0f} "
-            f"with size {obstacle.w:.0f}x{obstacle.h:.0f}. "
-            f"Estimated distance when your decision reaches the game: "
-            f"{distance_on_arrival:.0f} pixels "
-            f"({time_on_arrival:.2f} seconds before contact)."
+    if threat is None:
+        lines.append("No obstacle needs a reaction right now.")
+        return " ".join(lines)
+
+    if threat["kind"] == "cactus":
+        label, how = "a cactus", "It must be jumped over."
+    elif threat["need"] == "duck":
+        label, how = "a head-height bird", "It must be ducked under."
+    else:
+        label, how = "a low bird", "It must be jumped over."
+    lines.append(f"Nearest obstacle: {label}. {how}")
+
+    if threat["distance_on_arrival"] <= 0:
+        lines.append("When your decision is applied it will already be at the dino.")
+    else:
+        lines.append(
+            f"When your decision is applied it will be {threat['time_on_arrival']:.2f} "
+            "seconds from the dino."
         )
 
-    if not snapshot.obstacles:
-        details.append("There are no upcoming obstacles in view.")
+    window_text = {
+        "now": "NOW, act on this obstacle immediately.",
+        "early": "NOT YET, the obstacle is still too far away, so keep running.",
+        "missed": "MISSED, it is too late to jump, so keep running.",
+    }[threat["window"]]
+    lines.append(f"Reaction window: {window_text}")
+    return " ".join(lines)
+
+
+def pick_action(allowed: set[str], model_choice, probabilities) -> tuple[str, str]:
+    """Apply Laya's choice if it is valid, otherwise the most likely valid action."""
+    if isinstance(model_choice, str) and model_choice in allowed:
+        return model_choice, "Laya's choice was valid and applied."
+
+    if isinstance(probabilities, dict):
+        scored = [
+            (float(p), action)
+            for action, p in probabilities.items()
+            if action in allowed and isinstance(p, (int, float))
+        ]
+        if scored:
+            best = max(scored)[1]
+            return best, (
+                f"Laya chose {model_choice!r}, which is not valid right now "
+                f"(allowed: {sorted(allowed)}); used its best valid action {best!r}."
+            )
+
+    return "run", (
+        f"Laya chose {model_choice!r}, which is not valid right now "
+        f"(allowed: {sorted(allowed)}); defaulted to run."
+    )
+
+
+@app.post("/dino/act")
+def dino_act(snapshot: DinoSnapshot):
+    threat = find_threat(snapshot)
+    allowed = allowed_actions(snapshot, threat)
+    state = describe_state(snapshot, threat)
 
     result = router.predict(
-        {"body": " ".join(details)},
+        {"body": state},
         {
             "action": {
                 "type": "choice",
                 "instructions": (
-                    "Choose the safest action that should be applied after the estimated "
-                    "decision latency. For a cactus or low bird, choose jump only when the "
-                    "dino is grounded and the nearest such obstacle is predicted to be within "
-                    "0.30 seconds of contact when the decision arrives; if it is farther away, "
-                    "choose run and wait for a later decision. If the dino is airborne, choose "
-                    "run because it cannot start another jump. For a head-height bird, choose "
-                    "duck when it will reach the dino within 0.35 seconds, or is already "
-                    "overlapping the dino. High birds are safe to run under."
+                    "Pick one action for the dino. If the reaction window is NOW and the "
+                    "nearest obstacle must be jumped over, choose jump. If the reaction "
+                    "window is NOW and the nearest obstacle must be ducked under, choose "
+                    "duck. In every other case, including when the dino is in the air or "
+                    "no obstacle needs a reaction, choose run."
                 ),
                 "criteria": {
-                    "run": "The dino is airborne, the next jump obstacle is more than 0.30 seconds away on decision arrival, or only a safe high bird is present.",
-                    "jump": "The dino is grounded and a cactus or low bird will be within 0.30 seconds of contact when this decision arrives.",
-                    "duck": "A head-height bird will be within 0.35 seconds of contact on decision arrival or is already overlapping the dino.",
+                    "run": "The dino is in the air, no obstacle needs a reaction, or the reaction window is NOT YET or MISSED.",
+                    "jump": "The dino is on the ground, the nearest obstacle must be jumped over, and its reaction window is NOW.",
+                    "duck": "The dino is on the ground, the nearest obstacle must be ducked under, and its reaction window is NOW.",
                 },
             }
         },
@@ -112,20 +200,17 @@ def dino_act(snapshot: DinoSnapshot):
     answers = result.get("answers", {}) if isinstance(result, dict) else {}
     answer = answers.get("action", {}) if isinstance(answers, dict) else {}
     model_choice = answer.get("choice") if isinstance(answer, dict) else None
-    valid_choice = isinstance(model_choice, str) and model_choice in {"run", "jump", "duck"}
-    action = model_choice if valid_choice else "run"
-    reason = (
-        "Laya's choice was applied."
-        if valid_choice
-        else f"Unrecognized Laya choice {model_choice!r}; defaulted to run."
-    )
-
     probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
     confidence = answer.get("confidence") if isinstance(answer, dict) else None
+
+    action, reason = pick_action(allowed, model_choice, probabilities)
+
     return {
         "action": action,
         "debug": {
-            "state": " ".join(details),
+            "state": state,
+            "threat": threat,
+            "allowed_actions": [a for a in ACTIONS if a in allowed],
             "model_choice": model_choice,
             "applied_action": action,
             "reason": reason,

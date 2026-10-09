@@ -514,7 +514,21 @@
           }
         } else {
           aiJumpPending = false;
-          if (action === "duck") applicationReason = "Laya chose duck.";
+          if (action === "duck") {
+            // Only hold duck while a head-height bird is the nearest threat, so a
+            // stale or wrong "duck" can never keep the dino crouched on its own.
+            const nearestThreat = upcomingObstacles().find(function (obstacle) {
+              return obstacle.kind === "cactus" ||
+                obstacle.variant === "duck" ||
+                obstacle.variant === "jump";
+            });
+            if (nearestThreat && nearestThreat.kind === "bird" && nearestThreat.variant === "duck") {
+              applicationReason = "Laya chose duck.";
+            } else {
+              action = "run";
+              applicationReason = "Laya chose duck, but no head-height bird is the nearest threat; released duck.";
+            }
+          }
         }
 
         aiAppliedAction = action;
